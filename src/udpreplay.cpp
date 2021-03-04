@@ -10,6 +10,7 @@
 #include <netinet/udp.h>
 #include <pcap/pcap.h>
 #include <unistd.h>
+#include <time.h>
 
 #define NANOSECONDS_PER_SECOND 1000000000L
 
@@ -130,7 +131,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  timespec deadline = {};
+  timespec deadline;
   if (clock_gettime(CLOCK_MONOTONIC, &deadline) == -1) {
     std::cerr << "clock_gettime: " << strerror(errno) << std::endl;
     return 1;
@@ -151,6 +152,12 @@ int main(int argc, char *argv[]) {
 
     pcap_pkthdr header;
     const u_char *p;
+
+    bool raw_ip = (pcap_datalink(handle) == DLT_RAW);
+    if (raw_ip) {
+      std::cerr << "RAW_IP datalink" << std::endl; 
+    }
+    
     while ((p = pcap_next(handle, &header))) {
       if (start.tv_nsec == -1) {
         if (clock_gettime(CLOCK_MONOTONIC, &start) == -1) {
@@ -162,27 +169,36 @@ int main(int argc, char *argv[]) {
             header.ts.tv_usec; // Note PCAP_TSTAMP_PRECISION_NANO
       }
       if (header.len != header.caplen) {
+        std::cerr << "header.len != header.caplen" << std::endl;
         continue;
       }
-      auto eth = reinterpret_cast<const ether_header *>(p);
 
-      // jump over and ignore vlan tags
-      while (ntohs(eth->ether_type) == ETHERTYPE_VLAN) {
-        p += 4;
-        eth = reinterpret_cast<const ether_header *>(p);
+      
+      if (!raw_ip) {
+        auto eth = reinterpret_cast<const ether_header *>(p);
+        // jump over and ignore vlan tags
+        while (ntohs(eth->ether_type) == ETHERTYPE_VLAN) {
+          p += 4;
+          eth = reinterpret_cast<const ether_header *>(p);
+        }
+        if (ntohs(eth->ether_type) != ETHERTYPE_IP) {
+          std::cerr << "eth->ether_type != ETHERTYPE_IP: " << ntohs(eth->ether_type) << std::endl;        
+          continue;
+        }
+        p += sizeof(ether_header);
       }
-      if (ntohs(eth->ether_type) != ETHERTYPE_IP) {
-        continue;
-      }
-      auto ip = reinterpret_cast<const struct ip *>(p + sizeof(ether_header));
+
+      auto ip = reinterpret_cast<const struct ip *>(p);
+
       if (ip->ip_v != 4) {
+        std::cerr << "!IPv4" << std::endl;        
         continue;
       }
       if (ip->ip_p != IPPROTO_UDP) {
+        std::cerr << "!UDP" << std::endl;        
         continue;
       }
-      auto udp = reinterpret_cast<const udphdr *>(p + sizeof(ether_header) +
-                                                  ip->ip_hl * 4);
+      auto udp = reinterpret_cast<const udphdr *>(p + ip->ip_hl * 4);
       if (interval != -1) {
         // Use constant packet rate
         deadline.tv_sec += interval / 1000L;
@@ -207,7 +223,7 @@ int main(int argc, char *argv[]) {
         deadline.tv_nsec -= NANOSECONDS_PER_SECOND;
       }
 
-      timespec now = {};
+      timespec now;
       if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
         std::cerr << "clock_gettime: " << strerror(errno) << std::endl;
         return 1;
@@ -227,8 +243,10 @@ int main(int argc, char *argv[]) {
 #else
       ssize_t len = ntohs(udp->uh_ulen) - 8;
 #endif
+      std::cerr << "len=" << len << std::endl;
+
       const u_char *d =
-          &p[sizeof(ether_header) + ip->ip_hl * 4 + sizeof(udphdr)];
+          &p[ip->ip_hl * 4 + sizeof(udphdr)];
 
       sockaddr_in addr;
       memset(&addr, 0, sizeof(addr));
@@ -238,13 +256,15 @@ int main(int argc, char *argv[]) {
 #else
       addr.sin_port = udp->uh_dport;
 #endif
-      addr.sin_addr = {ip->ip_dst};
+      addr.sin_addr.s_addr = ip->ip_dst.s_addr;
+
       auto n = sendto(fd, d, len, 0, reinterpret_cast<sockaddr *>(&addr),
                       sizeof(addr));
       if (n != len) {
         std::cerr << "sendto: " << strerror(errno) << std::endl;
         return 1;
       }
+      std::cerr << "#" << std::endl;
     }
 
     pcap_close(handle);
